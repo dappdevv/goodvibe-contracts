@@ -32,7 +32,7 @@ contract GoodVibeNFT is ERC721, ERC721Enumerable, Ownable, EIP712, ERC721Votes, 
         Ownable(initialOwner)
         EIP712("GoodVibeNFT", "1")
     {
-        _baseTokenURI = initialBaseURI;
+        _baseTokenURI = "https://goodvibe.pages.dev/nft/";
     }
 
     modifier onlyActive() {

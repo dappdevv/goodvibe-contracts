@@ -1,105 +1,79 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@openzeppelin/contracts/token/ERC721/ERC721.sol";
 import "@openzeppelin/contracts/access/Ownable.sol";
 import "@openzeppelin/contracts/utils/Counters.sol";
+import "@openzeppelin/contracts/token/ERC721/IERC721.sol";
 import "./Users.sol";
+import "./Partners.sol";
 import "./GoodVibeNFT.sol";
 
-contract GoodVibeNFTAirdrop is ERC721, Ownable {
+contract GoodVibeNFTAirdrop is Ownable {
     using Counters for Counters.Counter;
-    Counters.Counter private _tokenIds;
-
-    struct Location {
-        int256 latitude;
-        int256 longitude;
-        bool isOccupied;
-    }
-
-    struct User {
-        uint256 verificationCount;
-        address referrer;
-        bool hasMinted;
-    }
-
-    mapping(uint256 => Location) public tokenLocations;
-    mapping(address => User) public users;
-    mapping(address => uint256) public availableBonusNFT;
-    mapping(address => mapping(address => bool)) public hasVerified;
-
-    event NFTMinted(address indexed to, uint256 tokenId, int256 latitude, int256 longitude);
-    event UserVerified(address indexed verifier, address indexed verified);
-    event BonusNFTAdded(address indexed referrer);
+    Counters.Counter private _airdropMinted;
+    Counters.Counter private _bonusMinted;
 
     DAOUsers public usersContract;
+    DAOPartners public partnersContract;
     GoodVibeNFT public nftContract;
 
-    constructor(address _usersContract, address _nftContract) ERC721("GoodVibeNFT", "GVNFT") Ownable(msg.sender) {
-        usersContract = DAOUsers(_usersContract);
-        nftContract = GoodVibeNFT(_nftContract);
+    mapping(address => bool) public hasMintedAirdrop;
+    mapping(address => uint256) public availableBonusNFT;
+    mapping(address => uint256) public bonusMinted;
+
+    event NFTAirdropMinted(address indexed user, uint256 tokenId);
+    event BonusNFTGranted(address indexed referrer, uint256 amount);
+    event BonusNFTMinted(address indexed referrer, uint256 tokenId);
+
+    constructor(address _users, address _partners, address _nft) Ownable(msg.sender) {
+        require(_users != address(0) && _partners != address(0) && _nft != address(0), "Zero address");
+        usersContract = DAOUsers(_users);
+        partnersContract = DAOPartners(_partners);
+        nftContract = GoodVibeNFT(_nft);
     }
 
-    function verifyUser(address userToVerify) external {
-        require(msg.sender != userToVerify, "Cannot verify yourself");
-        require(!hasVerified[msg.sender][userToVerify], "Already verified this user");
-        require(!users[userToVerify].hasMinted, "User already minted NFT");
-
-        hasVerified[msg.sender][userToVerify] = true;
-        users[userToVerify].verificationCount++;
-
-        emit UserVerified(msg.sender, userToVerify);
-    }
-
-    function setReferrer(address referrer) external {
-        require(users[msg.sender].referrer == address(0), "Referrer already set");
-        require(referrer != msg.sender, "Cannot set yourself as referrer");
-        require(referrer != address(0), "Invalid referrer address");
-
-        users[msg.sender].referrer = referrer;
-    }
-
-    function mintNFT(int256 latitude, int256 longitude) external {
-        require(usersContract.users(msg.sender).verificationCount >= 3, "Need 3 verifications to mint");
-        require(!users[msg.sender].hasMinted, "Already minted NFT");
-        require(!isLocationOccupied(latitude, longitude), "Location already occupied");
-
-        _tokenIds.increment();
-        uint256 newTokenId = _tokenIds.current();
-
-        _safeMint(msg.sender, newTokenId);
-        tokenLocations[newTokenId] = Location(latitude, longitude, true);
-        users[msg.sender].hasMinted = true;
-
-        // Add bonus NFT to referrer if exists
-        if (users[msg.sender].referrer != address(0)) {
-            availableBonusNFT[users[msg.sender].referrer]++;
-            emit BonusNFTAdded(users[msg.sender].referrer);
+    /// @notice Чеканка NFT для пользователя, соответствующего условиям
+    function mintAirdropNFT(int32 lng, int32 lat) external {
+        require(!hasMintedAirdrop[msg.sender], "Already minted");
+        DAOUsers.User memory user = usersContract.users(msg.sender);
+        require(user.registered > 0, "Not registered in DAO");
+        require(user.userAddress == msg.sender, "Invalid user");
+        require(user.name[0] != 0, "No username");
+        // Проверка верификаций и премиума через DAOPartners
+        require(partnersContract.getVerificationCount(msg.sender) >= 3, "Need 3 verifications");
+        require(partnersContract.hasActivePremium(msg.sender), "No active premium");
+        // Чеканим NFT через основной контракт
+        uint256 tokenId = nftContract.getTokenId(lng, lat);
+        require(!nftContract.exists(tokenId), "Token exists");
+        nftContract.mint(msg.sender, lng, lat);
+        hasMintedAirdrop[msg.sender] = true;
+        _airdropMinted.increment();
+        // Начисляем бонусный NFT рефереру
+        address referrer = user.referrer;
+        if (referrer != address(0)) {
+            availableBonusNFT[referrer]++;
+            emit BonusNFTGranted(referrer, availableBonusNFT[referrer]);
         }
-
-        emit NFTMinted(msg.sender, newTokenId, latitude, longitude);
+        emit NFTAirdropMinted(msg.sender, tokenId);
     }
 
-    function isLocationOccupied(int256 latitude, int256 longitude) public view returns (bool) {
-        for (uint256 i = 1; i <= _tokenIds.current(); i++) {
-            if (tokenLocations[i].latitude == latitude && 
-                tokenLocations[i].longitude == longitude && 
-                tokenLocations[i].isOccupied) {
-                return true;
-            }
-        }
-        return false;
+    /// @notice Чеканка бонусного NFT для реферера
+    function mintBonusNFT(int32 lng, int32 lat) external {
+        require(availableBonusNFT[msg.sender] > 0, "No bonus NFT");
+        uint256 tokenId = nftContract.getTokenId(lng, lat);
+        require(!nftContract.exists(tokenId), "Token exists");
+        nftContract.mint(msg.sender, lng, lat);
+        availableBonusNFT[msg.sender]--;
+        bonusMinted[msg.sender]++;
+        _bonusMinted.increment();
+        emit BonusNFTMinted(msg.sender, tokenId);
     }
 
-    function getVerificationCount(address user) external view returns (uint256) {
-        return users[user].verificationCount;
+    // Вспомогательные функции для статистики
+    function totalAirdropMinted() external view returns (uint256) {
+        return _airdropMinted.current();
     }
-
-    function getTokenLocation(uint256 tokenId) external view returns (Location memory) {
-        return tokenLocations[tokenId];
-    }
-
-    function getAvailableBonusNFT(address user) external view returns (uint256) {
-        return availableBonusNFT[user];
+    function totalBonusMinted() external view returns (uint256) {
+        return _bonusMinted.current();
     }
 }
