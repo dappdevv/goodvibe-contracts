@@ -1,307 +1,178 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.20;
+pragma solidity ^0.8.25;
 
 import "@openzeppelin/contracts/access/Ownable.sol";
-import "@openzeppelin/contracts/security/ReentrancyGuard.sol";
-import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
-import "@openzeppelin/contracts/security/Pausable.sol";
-import "./DAOContracts.sol";
-import "./Users.sol";
 
-contract Partners is Ownable, ReentrancyGuard, Pausable {
-    // Структуры
+contract DAOPartners is Ownable {
+    address public daoTreasury;
+
+    uint256 public premiumPrice = 1100 ether; // 1100 ETH (или другой нативный токен, зависит от сети)
+    uint256 public daoCommission = 1000; // 10% (10000 = 100%)
+    uint256 public constant COMMISSION_DENOMINATOR = 10000;
+    uint256 public constant MAX_PREMIUM_MONTHS = 6;
+    uint256 public constant PREMIUM_DURATION = 30 days;
+
+    // Маркетинг-план: проценты по уровням (10000 = 100%)
+    uint256[] public refPercents = [3000, 2000, 1000, 500, 500, 500, 500, 2000];
+    uint8 public constant LEVELS = 8;
+
     struct Partner {
-        uint256 partnerId;
         address user;
-        uint256 level;
-        uint256 totalReferrals;
-        uint256 activeReferrals;
-        uint256 totalEarnings;
-        uint256 pendingEarnings;
-        uint256 lastClaimTime;
-        bool isActive;
-    }
-
-    struct ReferralLevel {
-        uint256 level;
-        uint256 minReferrals;
-        uint256 rewardPercent;
-        uint256 minStake;
-        bool isActive;
-    }
-
-    struct Referral {
-        uint256 referralId;
         address referrer;
-        address referred;
-        uint256 level;
-        uint256 stake;
-        uint256 reward;
-        uint256 createdAt;
-        bool isActive;
+        uint256 premium;
+    }
+    mapping(address => Partner) public partners;
+
+    // Верификация
+    enum VerificationStatus { NONE, AWAITING, VERIFIED, REJECTED }
+    struct VerificationRequest {
+        uint256 id;
+        address verifiable;
+        address verificator;
+        string fioHash; // зашифрованная строка ФИО
+        string fioPlain; // ФИО для сравнения (можно убрать после верификации)
+        string selfie;
+        string key;
+        VerificationStatus status;
+    }
+    mapping(uint256 => VerificationRequest) public verifications;
+    mapping(address => uint256[]) public userVerifications;
+    uint256 public verificationCounter;
+
+    event PremiumPaid(address indexed user, uint256 months, uint256 amount, uint256 timestamp);
+    event VerificationStarted(uint256 indexed id, address indexed verifiable, address indexed verificator);
+    event Verified(uint256 indexed id, address indexed verifiable, address indexed verificator);
+    event VerificationRejected(uint256 indexed id);
+    event Withdraw(address indexed to, uint256 amount);
+    event ParamsChanged(uint256 premiumPrice, uint256 daoCommission);
+
+    constructor(address _daoTreasury) {
+        require(_daoTreasury != address(0), "Zero address");
+        daoTreasury = _daoTreasury;
     }
 
-    // Состояние
-    IERC20 public gvtToken;
-    DAOContracts public daoContracts;
-    DAOUsers public usersContract;
-    
-    mapping(address => Partner) public partners;
-    mapping(uint256 => ReferralLevel) public referralLevels;
-    mapping(uint256 => Referral) public referrals;
-    mapping(address => uint256[]) public userReferrals;
-    
-    uint256 private _levelCounter;
-    uint256 private _referralCounter;
-    
-    uint256 public constant DENOMINATOR = 1000;
-    uint256 public constant MIN_REWARD_PERCENT = 10; // 1%
-    uint256 public constant MAX_REWARD_PERCENT = 500; // 50%
-    uint256 public constant MIN_STAKE = 100 * 10**18; // 100 GVT
-    uint256 public constant MAX_LEVELS = 10;
-    
-    // События
-    event PartnerRegistered(address indexed user, uint256 level);
-    event ReferralLevelCreated(uint256 indexed level, uint256 minReferrals, uint256 rewardPercent);
-    event ReferralLevelUpdated(uint256 indexed level);
-    event ReferralCreated(uint256 indexed referralId, address indexed referrer, address indexed referred);
-    event RewardClaimed(address indexed partner, uint256 amount);
-    
-    // Модификаторы
-    modifier onlyGovernance() {
-        require(daoContracts.getContractAddress("DAO_GOVERNANCE") == msg.sender, "Only governance");
-        _;
+    function setPremiumPrice(uint256 price) external onlyOwner {
+        premiumPrice = price;
+        emit ParamsChanged(premiumPrice, daoCommission);
     }
-    
-    modifier onlyPartner() {
-        require(partners[msg.sender].isActive, "Not a partner");
-        _;
+    function setDAOCommission(uint256 commission) external onlyOwner {
+        require(commission <= COMMISSION_DENOMINATOR, "Too high");
+        daoCommission = commission;
+        emit ParamsChanged(premiumPrice, daoCommission);
     }
-    
-    // Конструктор
-    constructor(
-        address _gvtToken,
-        address _daoContracts,
-        address _usersContract
-    ) Ownable(msg.sender) {
-        gvtToken = IERC20(_gvtToken);
-        daoContracts = DAOContracts(_daoContracts);
-        usersContract = DAOUsers(_usersContract);
-        
-        // Создаем стандартные уровни
-        _createReferralLevel(1, 0, 50, MIN_STAKE); // 5% за 1 реферала
-        _createReferralLevel(2, 5, 100, MIN_STAKE * 2); // 10% за 5 рефералов
-        _createReferralLevel(3, 10, 200, MIN_STAKE * 5); // 20% за 10 рефералов
+    function setTreasury(address treasury) external onlyOwner {
+        require(treasury != address(0), "Zero address");
+        daoTreasury = treasury;
     }
-    
-    // Основные функции
-    function registerPartner(uint256 level) external nonReentrant whenNotPaused {
-        require(!partners[msg.sender].isActive, "Already registered");
-        require(level > 0 && level <= MAX_LEVELS, "Invalid level");
-        require(referralLevels[level].isActive, "Level not active");
-        
-        partners[msg.sender] = Partner({
-            partnerId: _levelCounter++,
-            user: msg.sender,
-            level: level,
-            totalReferrals: 0,
-            activeReferrals: 0,
-            totalEarnings: 0,
-            pendingEarnings: 0,
-            lastClaimTime: block.timestamp,
-            isActive: true
+    function withdraw(address payable to, uint256 amount) external onlyOwner {
+        require(to != address(0), "Zero address");
+        require(address(this).balance >= amount, "Insufficient balance");
+        to.transfer(amount);
+        emit Withdraw(to, amount);
+    }
+
+    // Оплата премиума и распределение по реферальной цепочке
+    function payPremium(uint8 months) external payable {
+        require(months > 0 && months <= MAX_PREMIUM_MONTHS, "Invalid months");
+        uint256 amount = premiumPrice * months;
+        require(msg.value >= amount, "Insufficient payment");
+        uint256 commission = (amount * daoCommission) / COMMISSION_DENOMINATOR;
+        if (commission > 0) {
+            payable(daoTreasury).transfer(commission);
+        }
+        uint256 toDistribute = amount - commission;
+        address current = partners[msg.sender].referrer;
+        for (uint8 i = 0; i < LEVELS; i++) {
+            uint256 reward = (amount * refPercents[i]) / COMMISSION_DENOMINATOR;
+            if (current != address(0) && partners[current].premium >= block.timestamp) {
+                payable(current).transfer(reward);
+                toDistribute -= reward;
+                current = partners[current].referrer;
+            } else {
+                // если нет премиума — средства остаются на контракте
+                current = current == address(0) ? address(0) : partners[current].referrer;
+            }
+        }
+        // Обновляем премиум
+        if (partners[msg.sender].premium < block.timestamp) {
+            partners[msg.sender].premium = block.timestamp + PREMIUM_DURATION * months;
+        } else {
+            partners[msg.sender].premium += PREMIUM_DURATION * months;
+        }
+        // Возврат излишка
+        if (msg.value > amount) {
+            payable(msg.sender).transfer(msg.value - amount);
+        }
+        emit PremiumPaid(msg.sender, months, amount, block.timestamp);
+    }
+
+    // Верификация пользователя
+    function startVerification(
+        string memory fioPlain,
+        address verificator,
+        string memory selfie,
+        string memory key,
+        string memory fioHash
+    ) external {
+        require(verificator != address(0), "Zero verificator");
+        uint256 id = verificationCounter++;
+        verifications[id] = VerificationRequest({
+            id: id,
+            verifiable: msg.sender,
+            verificator: verificator,
+            fioHash: fioHash,
+            fioPlain: fioPlain,
+            selfie: selfie,
+            key: key,
+            status: VerificationStatus.AWAITING
         });
-        
-        emit PartnerRegistered(msg.sender, level);
+        userVerifications[msg.sender].push(id);
+        userVerifications[verificator].push(id);
+        emit VerificationStarted(id, msg.sender, verificator);
     }
-    
-    function addReferral(
-        address referrer,
-        address referred,
-        uint256 stake
-    ) external nonReentrant whenNotPaused {
-        require(partners[referrer].isActive, "Referrer not active");
-        require(referrer != referred, "Cannot refer yourself");
-        require(stake >= MIN_STAKE, "Stake too small");
-        
-        Partner storage partner = partners[referrer];
-        ReferralLevel storage level = referralLevels[partner.level];
-        require(stake >= level.minStake, "Stake below minimum");
-        
-        uint256 reward = (stake * level.rewardPercent) / DENOMINATOR;
-        uint256 referralId = _referralCounter++;
-        
-        referrals[referralId] = Referral({
-            referralId: referralId,
-            referrer: referrer,
-            referred: referred,
-            level: partner.level,
-            stake: stake,
-            reward: reward,
-            createdAt: block.timestamp,
-            isActive: true
-        });
-        
-        userReferrals[referrer].push(referralId);
-        
-        partner.totalReferrals++;
-        partner.activeReferrals++;
-        partner.pendingEarnings += reward;
-        
-        emit ReferralCreated(referralId, referrer, referred);
+
+    function getAwaitingVerifications(address user) external view returns (uint256[] memory) {
+        uint256[] memory all = userVerifications[user];
+        uint256 count;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (verifications[all[i]].status == VerificationStatus.AWAITING) {
+                count++;
+            }
+        }
+        uint256[] memory awaiting = new uint256[](count);
+        uint256 idx;
+        for (uint256 i = 0; i < all.length; i++) {
+            if (verifications[all[i]].status == VerificationStatus.AWAITING) {
+                awaiting[idx++] = all[i];
+            }
+        }
+        return awaiting;
     }
-    
-    function claimRewards() external nonReentrant onlyPartner {
-        Partner storage partner = partners[msg.sender];
-        require(partner.pendingEarnings > 0, "No rewards to claim");
-        
-        uint256 amount = partner.pendingEarnings;
-        partner.pendingEarnings = 0;
-        partner.totalEarnings += amount;
-        partner.lastClaimTime = block.timestamp;
-        
-        require(gvtToken.transfer(msg.sender, amount), "Transfer failed");
-        
-        emit RewardClaimed(msg.sender, amount);
+
+    function verify(uint256 id, string memory fioPlain) external {
+        VerificationRequest storage req = verifications[id];
+        require(req.verificator == msg.sender, "Not your request");
+        require(req.status == VerificationStatus.AWAITING, "Not awaiting");
+        // Проверка совпадения ФИО (дешифрование вне контракта, сравнение plain)
+        require(keccak256(bytes(req.fioPlain)) == keccak256(bytes(fioPlain)), "FIO mismatch");
+        req.status = VerificationStatus.VERIFIED;
+        emit Verified(id, req.verifiable, msg.sender);
     }
-    
-    // Административные функции
-    function _createReferralLevel(
-        uint256 level,
-        uint256 minReferrals,
-        uint256 rewardPercent,
-        uint256 minStake
-    ) internal {
-        require(level > 0 && level <= MAX_LEVELS, "Invalid level");
-        require(rewardPercent >= MIN_REWARD_PERCENT && rewardPercent <= MAX_REWARD_PERCENT, "Invalid reward");
-        require(minStake >= MIN_STAKE, "Invalid stake");
-        
-        referralLevels[level] = ReferralLevel({
-            level: level,
-            minReferrals: minReferrals,
-            rewardPercent: rewardPercent,
-            minStake: minStake,
-            isActive: true
-        });
-        
-        emit ReferralLevelCreated(level, minReferrals, rewardPercent);
+
+    function rejectVerification(uint256 id) external {
+        VerificationRequest storage req = verifications[id];
+        require(req.verificator == msg.sender, "Not your request");
+        require(req.status == VerificationStatus.AWAITING, "Not awaiting");
+        req.status = VerificationStatus.REJECTED;
+        emit VerificationRejected(id);
     }
-    
-    function createReferralLevel(
-        uint256 level,
-        uint256 minReferrals,
-        uint256 rewardPercent,
-        uint256 minStake
-    ) external onlyOwner {
-        _createReferralLevel(level, minReferrals, rewardPercent, minStake);
+
+    // Регистрация партнёра (вызывается при регистрации пользователя)
+    function registerPartner(address user, address referrer) external onlyOwner {
+        require(user != address(0), "Zero user");
+        partners[user] = Partner({user: user, referrer: referrer, premium: 0});
     }
-    
-    function updateReferralLevel(
-        uint256 level,
-        uint256 minReferrals,
-        uint256 rewardPercent,
-        uint256 minStake
-    ) external onlyOwner {
-        ReferralLevel storage referralLevel = referralLevels[level];
-        require(referralLevel.isActive, "Level not active");
-        require(rewardPercent >= MIN_REWARD_PERCENT && rewardPercent <= MAX_REWARD_PERCENT, "Invalid reward");
-        require(minStake >= MIN_STAKE, "Invalid stake");
-        
-        referralLevel.minReferrals = minReferrals;
-        referralLevel.rewardPercent = rewardPercent;
-        referralLevel.minStake = minStake;
-        
-        emit ReferralLevelUpdated(level);
-    }
-    
-    function deactivatePartner(address partner) external onlyOwner {
-        require(partners[partner].isActive, "Partner not active");
-        partners[partner].isActive = false;
-    }
-    
-    function pause() external onlyOwner {
-        _pause();
-    }
-    
-    function unpause() external onlyOwner {
-        _unpause();
-    }
-    
-    function updateContracts(
-        address _gvtToken,
-        address _daoContracts,
-        address _usersContract
-    ) external onlyOwner {
-        gvtToken = IERC20(_gvtToken);
-        daoContracts = DAOContracts(_daoContracts);
-        usersContract = DAOUsers(_usersContract);
-    }
-    
-    // Вспомогательные функции
-    function getUserReferrals(address user) external view returns (uint256[] memory) {
-        return userReferrals[user];
-    }
-    
-    function getPartnerDetails(address partner) external view returns (
-        uint256 id,
-        uint256 level,
-        uint256 totalReferrals,
-        uint256 activeReferrals,
-        uint256 totalEarnings,
-        uint256 pendingEarnings,
-        uint256 lastClaimTime,
-        bool isActive
-    ) {
-        Partner storage p = partners[partner];
-        return (
-            p.partnerId,
-            p.level,
-            p.totalReferrals,
-            p.activeReferrals,
-            p.totalEarnings,
-            p.pendingEarnings,
-            p.lastClaimTime,
-            p.isActive
-        );
-    }
-    
-    function getReferralLevelDetails(uint256 level) external view returns (
-        uint256 id,
-        uint256 minReferrals,
-        uint256 rewardPercent,
-        uint256 minStake,
-        bool isActive
-    ) {
-        ReferralLevel storage l = referralLevels[level];
-        return (
-            l.level,
-            l.minReferrals,
-            l.rewardPercent,
-            l.minStake,
-            l.isActive
-        );
-    }
-    
-    function getReferralDetails(uint256 referralId) external view returns (
-        uint256 id,
-        address referrer,
-        address referred,
-        uint256 level,
-        uint256 stake,
-        uint256 reward,
-        uint256 createdAt,
-        bool isActive
-    ) {
-        Referral storage r = referrals[referralId];
-        return (
-            r.referralId,
-            r.referrer,
-            r.referred,
-            r.level,
-            r.stake,
-            r.reward,
-            r.createdAt,
-            r.isActive
-        );
-    }
-} 
+
+    // Приём ETH
+    receive() external payable {}
+}
