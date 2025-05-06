@@ -1,0 +1,17 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+# Структура проекта goodvibe-contracts
+
+Проект построен на Hardhat 3 Alpha и предназначен для разработки, тестирования и деплоя смарт-контрактов на Solidity. Основные директории и их назначение:
+
+- [contracts/](mdc:contracts): Основные смарт-контракты проекта (DAO, Marketplace, NFT, P2P, страхование, финансы и др.).
+- [test/](mdc:test): Интеграционные и юнит-тесты на TypeScript и Solidity.
+- [scripts/](mdc:scripts): Скрипты для вспомогательных операций (например, predeploy, отправка транзакций).
+- [ignition/modules/](mdc:ignition/modules): Модули для деплоя контрактов через Hardhat Ignition.
+- [hardhat.config.ts](mdc:hardhat.config.ts): Конфигурация Hardhat, включая плагины, профили компилятора, remappings и настройки сетей (локальные и Sepolia).
+- [README.md](mdc:README.md): Описание проекта, инструкции по запуску тестов и деплою.
+
+Проект использует современные инструменты: Hardhat 3, viem, node:test, TypeScript, поддерживает деплой в тестовую сеть Sepolia и локальные симуляции.
